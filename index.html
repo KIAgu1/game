@@ -14,6 +14,31 @@
   }
   canvas { display: block; cursor: crosshair; }
 
+  /* ── 메인 메뉴 ── */
+  #main-menu {
+    display: none;
+    position: fixed; inset: 0;
+    background: radial-gradient(circle at top, rgba(76, 201, 240, 0.16), rgba(0,0,0,0.82));
+    color: #fff;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 110;
+    text-align: center;
+  }
+  #main-menu h1 { font-size: 3.2rem; margin-bottom: 0.6rem; color: #9be7ff; text-shadow: 0 0 20px rgba(76,201,240,0.35); }
+  #main-menu p  { font-size: 1.1rem; margin-bottom: 1.5rem; color: #d7e6f2; }
+  #menu-play-btn {
+    padding: 0.9rem 2.8rem;
+    font-size: 1.15rem;
+    background: #4ecdc4;
+    border: none; border-radius: 10px;
+    cursor: pointer; color: #000; font-weight: 700;
+    transition: transform .15s, background .15s;
+  }
+  #menu-play-btn:hover { background: #45b7aa; transform: scale(1.05); }
+  #menu-tip { margin-top: 1.2rem; font-size: 0.95rem; color: #a9c7d8; line-height: 1.7; }
+
   /* ── 사망 화면 ── */
   #death-screen {
     display: none;
@@ -41,11 +66,20 @@
 <body>
 <canvas id="gameCanvas"></canvas>
 
+<!-- 메인 메뉴 -->
+<div id="main-menu">
+  <h1>대포 키우기</h1>
+  <p>Diep Clone 스타일의 간단한 생존 슈팅</p>
+  <button id="menu-play-btn" onclick="startGame()">게임 시작</button>
+  <div id="menu-tip">WASD / 방향키 이동 · 마우스 조준 · 좌클릭 / 스페이스 발사</div>
+</div>
+
 <!-- 사망 화면 -->
 <div id="death-screen">
   <h1>💀 사망!</h1>
   <p id="death-info"></p>
   <button id="restart-btn" onclick="restartGame()">다시 시작</button>
+  <button id="menu-return-btn" style="margin-top:12px;background:#ffd166;" onclick="showMainMenu()">메인 메뉴</button>
 </div>
 
 <script>
@@ -200,6 +234,7 @@ window.addEventListener('keydown', unlockAudio, { passive: true });
 //  게임 전역 상태
 // ═══════════════════════════════════════════════════════════════
 let game = {};   // initGame() 으로 초기화
+let gameRunning = false;
 
 // ═══════════════════════════════════════════════════════════════
 //  파티클 (파괴 효과)
@@ -441,7 +476,7 @@ class Tank {
   }
 
   // ── 파생 스탯 계산 ──
-  get derivedSpeed()   { return 1.8 + this.stats.moveSpeed * 0.4; }
+  get derivedSpeed()   { return 1.8 + this.stats.moveSpeed * 0.22; }
   get derivedMaxHp()   { return 100 + this.stats.maxHealth * 30; }
   get derivedRegen()   { return 0.05 + this.stats.healthRegen * 0.15; }
   get derivedReload()  { return Math.max(4, 30 - this.stats.reload * 3); }
@@ -509,7 +544,7 @@ class Tank {
     // 반동
     this.vx -= Math.cos(angle) * 1.2;
     this.vy -= Math.sin(angle) * 1.2;
-    playSfx('shoot');
+    if (this.isPlayer) playSfx('shoot');
     return new Bullet(bx, by, angle, this.stats, this);
   }
 
@@ -1832,6 +1867,7 @@ function inView(obj, cam, margin = 60) {
 //  메인 루프
 // ═══════════════════════════════════════════════════════════════
 function gameLoop() {
+  if (!gameRunning) return;
   if (game.over) return;
   game.frame++;
 
@@ -1933,6 +1969,7 @@ function gameLoop() {
 // ═══════════════════════════════════════════════════════════════
 function showDeathScreen() {
   playSfx('death');
+  gameRunning = false;
   const el = document.getElementById('death-screen');
   el.style.display = 'flex';
 
@@ -1944,17 +1981,28 @@ function showDeathScreen() {
     `레벨 ${game.player.level} · 점수 ${game.player.score.toLocaleString()} · 순위 ${rank}위`;
 }
 
-function restartGame() {
+function showMainMenu() {
+  gameRunning = false;
+  document.getElementById('death-screen').style.display = 'none';
+  document.getElementById('main-menu').style.display = 'flex';
+}
+
+function startGame() {
+  document.getElementById('main-menu').style.display = 'none';
   document.getElementById('death-screen').style.display = 'none';
   initGame();
+  gameRunning = true;
   requestAnimationFrame(gameLoop);
+}
+
+function restartGame() {
+  startGame();
 }
 
 // ═══════════════════════════════════════════════════════════════
 //  시작
 // ═══════════════════════════════════════════════════════════════
-initGame();
-requestAnimationFrame(gameLoop);
+showMainMenu();
 </script>
 </body>
 </html>
