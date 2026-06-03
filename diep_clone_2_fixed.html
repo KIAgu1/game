@@ -1,0 +1,1960 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>대포 키우기 (Diep Clone)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    overflow: hidden;
+    font-family: 'Segoe UI', sans-serif;
+    user-select: none;
+  }
+  canvas { display: block; cursor: crosshair; }
+
+  /* ── 사망 화면 ── */
+  #death-screen {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.75);
+    color: #fff;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  #death-screen h1 { font-size: 3rem; margin-bottom: 1rem; color: #ff6b6b; }
+  #death-screen p  { font-size: 1.2rem; margin-bottom: 2rem; color: #ccc; }
+  #restart-btn {
+    padding: 0.8rem 2.5rem;
+    font-size: 1.1rem;
+    background: #4ecdc4;
+    border: none; border-radius: 8px;
+    cursor: pointer; color: #000; font-weight: 700;
+    transition: transform .15s, background .15s;
+  }
+  #restart-btn:hover { background: #45b7aa; transform: scale(1.05); }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<!-- 사망 화면 -->
+<div id="death-screen">
+  <h1>💀 사망!</h1>
+  <p id="death-info"></p>
+  <button id="restart-btn" onclick="restartGame()">다시 시작</button>
+</div>
+
+<script>
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════
+//  전역 상수 & 캔버스 설정
+// ═══════════════════════════════════════════════════════════════
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+
+const MAP_W  = 3000;   // 가상 맵 너비
+const MAP_H  = 3000;   // 가상 맵 높이
+const GRID   = 50;     // 격자 간격
+
+// 도형 종류별 설정
+const SHAPE_TYPES = {
+  square:  { sides: 4, color: '#f9ca24', stroke: '#f0932b', hp: 10,  exp: 10,  size: 22, speed: 0.3,  score: 10  },
+  triangle:{ sides: 3, color: '#4fc3f7', stroke: '#0288d1', hp: 25,  exp: 25,  size: 26, speed: 0.5,  score: 25  },
+  pentagon:{ sides: 5, color: '#ce93d8', stroke: '#8e24aa', hp: 100, exp: 130, size: 36, speed: 0.2,  score: 130 },
+};
+
+// 능력치 항목 이름
+const STAT_NAMES = [
+  '이동 속도','최대 체력','체력 재생','총알 데미지',
+  '총알 속도','장전 속도','총알 관통력','몸체 데미지'
+];
+
+// ═══════════════════════════════════════════════════════════════
+//  유틸 함수
+// ═══════════════════════════════════════════════════════════════
+const rand    = (a, b)   => Math.random() * (b - a) + a;
+const randInt = (a, b)   => Math.floor(rand(a, b + 1));
+const dist    = (a, b)   => Math.hypot(a.x - b.x, a.y - b.y);
+const clamp   = (v,mn,mx)=> Math.max(mn, Math.min(mx, v));
+const lerp    = (a,b,t)  => a + (b - a) * t;
+
+// EXP 테이블(레벨별 누적 필요 경험치)
+function expForLevel(lv) {
+  // diep.io 근사 공식
+  return Math.floor(Math.pow(lv, 1.5) * 30 + lv * 20);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  입력 상태
+// ═══════════════════════════════════════════════════════════════
+const keys  = {};
+const mouse = { x: 0, y: 0, down: false };
+
+window.addEventListener('keydown', e => {
+  unlockAudio();
+  keys[e.code] = true;
+  // 스페이스바로도 발사
+  if (e.code === 'Space') mouse.down = true;
+  e.code === 'Space' && e.preventDefault();
+});
+window.addEventListener('keyup', e => {
+  keys[e.code] = false;
+  if (e.code === 'Space') mouse.down = false;
+});
+canvas.addEventListener('mousemove', e => {
+  mouse.x = e.clientX;
+  mouse.y = e.clientY;
+});
+canvas.addEventListener('mousedown', e => { if (e.button === 0) mouse.down = true; });
+canvas.addEventListener('mouseup',   e => { if (e.button === 0) mouse.down = false; });
+// 우클릭 메뉴 방지
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ═══════════════════════════════════════════════════════════════
+//  사운드 시스템 (Web Audio)
+// ═══════════════════════════════════════════════════════════════
+const audioState = {
+  ctx: null,
+  unlocked: false,
+};
+
+function unlockAudio() {
+  try {
+    if (!audioState.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioState.ctx = new AC();
+    }
+    if (audioState.ctx.state === 'suspended') {
+      audioState.ctx.resume();
+    }
+    audioState.unlocked = true;
+  } catch (_) {
+    // 오디오를 사용할 수 없는 환경이면 조용히 무시
+  }
+}
+
+function playSfx(kind = 'select') {
+  unlockAudio();
+  const ac = audioState.ctx;
+  if (!ac || ac.state !== 'running') return;
+
+  const now = ac.currentTime;
+  const master = ac.createGain();
+  master.gain.value = 0.12;
+  master.connect(ac.destination);
+
+  const tone = (freq, dur, type = 'sine', vol = 0.8, detune = 0) => {
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, now);
+    osc.detune.setValueAtTime(detune, now);
+
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    osc.connect(gain);
+    gain.connect(master);
+    osc.start(now);
+    osc.stop(now + dur + 0.03);
+  };
+
+  switch (kind) {
+    case 'shoot':
+      tone(320, 0.06, 'square', 0.28);
+      tone(220, 0.08, 'triangle', 0.12);
+      break;
+    case 'hit':
+      tone(120, 0.07, 'square', 0.2);
+      tone(75, 0.1, 'sine', 0.08);
+      break;
+    case 'levelup':
+      tone(392, 0.09, 'triangle', 0.16);
+      tone(523.25, 0.09, 'triangle', 0.16, 4);
+      tone(659.25, 0.12, 'triangle', 0.15, 8);
+      break;
+    case 'select':
+      tone(440, 0.07, 'sine', 0.12);
+      tone(660, 0.09, 'triangle', 0.1);
+      break;
+    case 'death':
+      tone(180, 0.14, 'sawtooth', 0.18);
+      tone(90, 0.22, 'sine', 0.14);
+      break;
+    default:
+      tone(440, 0.06, 'sine', 0.1);
+  }
+}
+
+window.addEventListener('pointerdown', unlockAudio, { passive: true });
+window.addEventListener('keydown', unlockAudio, { passive: true });
+
+// ═══════════════════════════════════════════════════════════════
+//  게임 전역 상태
+// ═══════════════════════════════════════════════════════════════
+let game = {};   // initGame() 으로 초기화
+
+// ═══════════════════════════════════════════════════════════════
+//  파티클 (파괴 효과)
+// ═══════════════════════════════════════════════════════════════
+class Particle {
+  constructor(x, y, color) {
+    this.x  = x; this.y = y;
+    this.vx = rand(-3, 3);
+    this.vy = rand(-3, 3);
+    this.alpha = 1;
+    this.radius = rand(3, 8);
+    this.color  = color;
+    this.decay  = rand(0.02, 0.05);
+  }
+  update() {
+    this.x  += this.vx;
+    this.y  += this.vy;
+    this.vx *= 0.92;
+    this.vy *= 0.92;
+    this.alpha -= this.decay;
+  }
+  draw() {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, this.alpha);
+    ctx.fillStyle   = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+  get dead() { return this.alpha <= 0; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  총알 클래스
+// ═══════════════════════════════════════════════════════════════
+class Bullet {
+  /**
+   * @param {number} x, y  - 발사 위치
+   * @param {number} angle - 발사 각도(rad)
+   * @param {object} stats - 발사체 소유자의 스탯
+   * @param {object} owner - 소유자 참조 (player/bot)
+   */
+  constructor(x, y, angle, stats, owner) {
+    this.x      = x;
+    this.y      = y;
+    this.angle  = angle;
+    this.owner  = owner;
+
+    // 스탯 기반 값 계산
+    this.speed  = 12 + stats.bulletSpeed * 1.5;
+    this.damage = 8  + stats.bulletDamage * 3;
+    this.hp     = 1  + stats.bulletPen;       // 관통력 = 총알 체력
+    this.maxHp  = this.hp;
+    this.radius = 7  + stats.bulletPen * 0.5;
+
+    this.vx = Math.cos(angle) * this.speed;
+    this.vy = Math.sin(angle) * this.speed;
+
+    this.life   = 0;
+    this.maxLife= 90;  // 프레임 수명
+    this.color  = owner === game.player ? '#00aaff' : '#ff4444';
+  }
+
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.life++;
+  }
+
+  draw(cam) {
+    const sx = this.x - cam.x;
+    const sy = this.y - cam.y;
+    ctx.save();
+    ctx.shadowBlur  = 8;
+    ctx.shadowColor = this.color;
+    ctx.fillStyle   = this.color;
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.arc(sx, sy, this.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  get dead() {
+    return this.hp <= 0 || this.life >= this.maxLife ||
+      this.x < 0 || this.x > MAP_W || this.y < 0 || this.y > MAP_H;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  도형 클래스 (사각형 / 삼각형 / 오각형)
+// ═══════════════════════════════════════════════════════════════
+class Shape {
+  constructor(type) {
+    this.type   = type;
+    const cfg   = SHAPE_TYPES[type];
+    this.x      = rand(100, MAP_W - 100);
+    this.y      = rand(100, MAP_H - 100);
+    this.vx     = rand(-cfg.speed, cfg.speed);
+    this.vy     = rand(-cfg.speed, cfg.speed);
+    this.angle  = rand(0, Math.PI * 2);
+    this.rotSpd = rand(-0.01, 0.01);
+    this.radius = cfg.size;
+    this.maxHp  = cfg.hp;
+    this.hp     = cfg.hp;
+    this.exp    = cfg.exp;
+    this.score  = cfg.score;
+    this.sides  = cfg.sides;
+    this.color  = cfg.color;
+    this.stroke = cfg.stroke;
+    this.flashTimer = 0;
+  }
+
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.angle += this.rotSpd;
+    // 맵 경계 반사
+    if (this.x < this.radius || this.x > MAP_W - this.radius) this.vx *= -1;
+    if (this.y < this.radius || this.y > MAP_H - this.radius) this.vy *= -1;
+    if (this.flashTimer > 0) this.flashTimer--;
+  }
+
+  takeDamage(dmg, knockVx, knockVy) {
+    this.hp -= dmg;
+    this.flashTimer = 5;
+    this.vx += knockVx * 0.3;
+    this.vy += knockVy * 0.3;
+  }
+
+  draw(cam) {
+    const sx = this.x - cam.x;
+    const sy = this.y - cam.y;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(this.angle);
+
+    // 피격 시 흰색 플래시
+    ctx.fillStyle   = this.flashTimer > 0 ? '#ffffff' : this.color;
+    ctx.strokeStyle = this.stroke;
+    ctx.lineWidth   = 3;
+    ctx.lineJoin    = 'round';
+
+    ctx.beginPath();
+    for (let i = 0; i < this.sides; i++) {
+      const a = (i / this.sides) * Math.PI * 2 - Math.PI / 2;
+      const px = Math.cos(a) * this.radius;
+      const py = Math.sin(a) * this.radius;
+      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
+    // 체력 바
+    this.drawHpBar(sx, sy);
+  }
+
+  drawHpBar(sx, sy) {
+    if (this.hp >= this.maxHp) return;
+    const bw = this.radius * 2;
+    const bh = 5;
+    const bx = sx - bw / 2;
+    const by = sy + this.radius + 6;
+    const ratio = this.hp / this.maxHp;
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = '#76ff03';
+    ctx.fillRect(bx, by, bw * ratio, bh);
+  }
+
+  get dead() { return this.hp <= 0; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tank 기반 클래스 (플레이어 & 봇 공통)
+// ═══════════════════════════════════════════════════════════════
+class Tank {
+  constructor(x, y, isPlayer, name) {
+    this.x      = x;
+    this.y      = y;
+    this.isPlayer = isPlayer;
+    this.name   = name || 'Unknown';
+
+    this.angle  = 0;
+    this.radius = 28;
+
+    // ── 레벨 & 경험치 ──
+    this.level  = 1;
+    this.exp    = 0;
+    this.score  = 0;
+    this.statPoints = 0;  // 사용 가능한 스탯 포인트
+
+    // ── 직업(클래스) ──
+    this.jobId   = null;
+    this.jobName = '직업 미선택';
+
+    // ── 8가지 스탯 (0~7 단계) ──
+    this.stats = {
+      moveSpeed:   0,
+      maxHealth:   0,
+      healthRegen: 0,
+      bulletDamage:0,
+      bulletSpeed: 0,
+      reload:      0,
+      bulletPen:   0,
+      bodyDamage:  0,
+    };
+
+    // ── 체력 ──
+    this.maxHp  = 100;
+    this.hp     = 100;
+    this.regenTimer = 0;
+
+    // ── 이동 ──
+    this.vx = 0; this.vy = 0;
+    this.friction = 0.85;
+
+    // ── 총알 발사 ──
+    this.reloadTimer = 0;
+
+    // ── 무적 시간 (데미지 후) ──
+    this.flashTimer = 0;
+
+    // ── 색상 (봇마다 다름) ──
+    this.color  = isPlayer ? '#4fc3f7' : this.randomBotColor();
+    this.barrelColor = isPlayer ? '#1a6fa8' : '#555';
+  }
+
+  randomBotColor() {
+    const cols = ['#ef9a9a','#ffcc80','#a5d6a7','#ce93d8','#80cbc4','#fff59d','#ff8a65'];
+    return cols[randInt(0, cols.length - 1)];
+  }
+
+  // ── 파생 스탯 계산 ──
+  get derivedSpeed()   { return 1.8 + this.stats.moveSpeed * 0.4; }
+  get derivedMaxHp()   { return 100 + this.stats.maxHealth * 30; }
+  get derivedRegen()   { return 0.05 + this.stats.healthRegen * 0.15; }
+  get derivedReload()  { return Math.max(4, 30 - this.stats.reload * 3); }
+  get derivedBodyDmg() { return 5  + this.stats.bodyDamage * 4; }
+
+  // ── 레벨업 처리 ──
+  addExp(amount) {
+    this.exp   += amount;
+    this.score += amount;
+    while (this.level < 45 && this.exp >= expForLevel(this.level)) {
+      this.exp -= expForLevel(this.level);
+      this.level++;
+      // 체력 완충
+      const newMax = this.derivedMaxHp;
+      this.hp = Math.min(this.hp + 20, newMax);
+      this.maxHp = newMax;
+
+      if (this.isPlayer) {
+        // 플레이어는 카드 선택창 표시 (큐에 쌓기)
+        playSfx('levelup');
+        queueUpgradeCard();
+      } else {
+        // 봇은 스탯 포인트로 자동 배분
+        this.statPoints++;
+      }
+    }
+  }
+
+  // ── 봇 전용: 스탯 포인트 자동 배분 ──
+  autoUpgrade() {
+    while (this.statPoints > 0) {
+      const keys = Object.keys(this.stats);
+      const pick  = keys[randInt(0, keys.length - 1)];
+      if (this.stats[pick] < 7) {
+        this.stats[pick]++;
+        this.statPoints--;
+        this.maxHp = this.derivedMaxHp;
+      } else {
+        // 모두 7이면 중단
+        let allMax = true;
+        for (const k of keys) if (this.stats[k] < 7) { allMax = false; break; }
+        if (allMax) { this.statPoints = 0; break; }
+      }
+    }
+  }
+
+  // ── 피해 처리 ──
+  takeDamage(dmg, knockVx, knockVy) {
+    if (this.flashTimer > 0) return;  // 무적 프레임
+    this.hp -= dmg;
+    this.vx += knockVx;
+    this.vy += knockVy;
+    this.flashTimer = 8;
+    this.regenTimer = 180; // 3초간 재생 억제
+    if (this.isPlayer) playSfx('hit');
+  }
+
+  // ── 총알 발사 ──
+  shoot(angle) {
+    if (this.reloadTimer > 0) return null;
+    this.reloadTimer = this.derivedReload;
+    // 포신 끝에서 발사
+    const bx = this.x + Math.cos(angle) * (this.radius + 20);
+    const by = this.y + Math.sin(angle) * (this.radius + 20);
+    // 반동
+    this.vx -= Math.cos(angle) * 1.2;
+    this.vy -= Math.sin(angle) * 1.2;
+    playSfx('shoot');
+    return new Bullet(bx, by, angle, this.stats, this);
+  }
+
+  update() {
+    // 타이머
+    if (this.reloadTimer > 0) this.reloadTimer--;
+    if (this.flashTimer  > 0) this.flashTimer--;
+    // 체력 재생
+    if (this.regenTimer > 0) {
+      this.regenTimer--;
+    } else {
+      this.maxHp = this.derivedMaxHp;
+      if (this.hp < this.maxHp) this.hp = Math.min(this.maxHp, this.hp + this.derivedRegen);
+    }
+    // 이동
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vx *= this.friction;
+    this.vy *= this.friction;
+    // 맵 경계
+    this.x = clamp(this.x, this.radius, MAP_W - this.radius);
+    this.y = clamp(this.y, this.radius, MAP_H - this.radius);
+    // 사망 체크
+    if (this.hp <= 0) this.hp = 0;
+  }
+
+  // ── 공통 렌더링 ──
+  draw(cam) {
+    const sx = this.x - cam.x;
+    const sy = this.y - cam.y;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    // 피격 플래시
+    const flash = this.flashTimer > 0;
+
+    // ── 포신(barrel) ──
+    ctx.save();
+    ctx.rotate(this.angle);
+    const blen = 40; const bwid = 18;
+    ctx.fillStyle   = flash ? '#ffffff' : this.barrelColor;
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.roundRect(0, -bwid / 2, blen, bwid, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
+    // ── 몸통(body) ──
+    ctx.fillStyle   = flash ? '#ffffff' : this.color;
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth   = 3;
+    ctx.beginPath();
+    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // ── 이름 ──
+    ctx.fillStyle = '#fff';
+    ctx.font      = `bold 12px 'Segoe UI', sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(this.name, 0, 0);
+
+    ctx.restore();
+
+    // ── 체력 바 ──
+    this.drawHpBar(sx, sy);
+  }
+
+  drawHpBar(sx, sy) {
+    const bw  = 60; const bh = 7;
+    const bx  = sx - bw / 2;
+    const by  = sy - this.radius - 16;
+    const ratio = clamp(this.hp / this.maxHp, 0, 1);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(bx, by, bw, bh);
+
+    // 색 그라디언트: 초록→노랑→빨강
+    const g = ctx.createLinearGradient(bx, by, bx + bw * ratio, by);
+    g.addColorStop(0, '#76ff03');
+    g.addColorStop(0.5, '#ffeb3b');
+    g.addColorStop(1, '#ff5252');
+    ctx.fillStyle = g;
+    ctx.fillRect(bx, by, bw * ratio, bh);
+
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(bx, by, bw, bh);
+  }
+
+  get dead() { return this.hp <= 0; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  플레이어 클래스
+// ═══════════════════════════════════════════════════════════════
+class Player extends Tank {
+  constructor() {
+    super(MAP_W / 2, MAP_H / 2, true, 'YOU');
+    this.color  = '#4fc3f7';
+    this.barrelColor = '#1a6fa8';
+  }
+
+  update() {
+    // ── WASD / 방향키 이동 ──
+    const spd = this.derivedSpeed;
+    if (keys['KeyW'] || keys['ArrowUp'])    this.vy -= spd;
+    if (keys['KeyS'] || keys['ArrowDown'])  this.vy += spd;
+    if (keys['KeyA'] || keys['ArrowLeft'])  this.vx -= spd;
+    if (keys['KeyD'] || keys['ArrowRight']) this.vx += spd;
+
+    // ── 마우스 방향으로 포신 각도 갱신 ──
+    const cam = game.camera;
+    this.angle = Math.atan2(
+      mouse.y - (this.y - cam.y),
+      mouse.x - (this.x - cam.x)
+    );
+
+    super.update();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  봇 AI 클래스
+// ═══════════════════════════════════════════════════════════════
+class Bot extends Tank {
+  constructor(name) {
+    const x = rand(100, MAP_W - 100);
+    const y = rand(100, MAP_H - 100);
+    super(x, y, false, name);
+
+    this.targetX   = rand(0, MAP_W);
+    this.targetY   = rand(0, MAP_H);
+    this.wanderTimer = 0;
+    this.aggroRange  = 430;
+    this.shootRange  = 360;
+    this.reaction    = randInt(0, 8);
+    this.strafeDir   = Math.random() < 0.5 ? -1 : 1;
+    this.strafeTimer = randInt(45, 120);
+  }
+
+  update() {
+    this.wanderTimer--;
+    this.strafeTimer--;
+    if (this.strafeTimer <= 0) {
+      this.strafeDir *= -1;
+      this.strafeTimer = randInt(45, 120);
+    }
+
+    // ── 가장 가까운 타겟 탐색 (플레이어 > 봇 > 도형) ──
+    let best = null, bestScore = Infinity;
+
+    const consider = (candidate, weight = 1) => {
+      if (!candidate || candidate.dead) return;
+      const d = dist(this, candidate);
+      if (d > this.aggroRange) return;
+      const hpBias = (candidate.hp ?? candidate.maxHp ?? 100) * 0.2;
+      const score = d * weight - hpBias;
+      if (score < bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
+    };
+
+    consider(game.player, 0.9);
+    for (const b of game.bots) {
+      if (b === this) continue;
+      consider(b, 1.0);
+    }
+    for (const s of game.shapes) consider(s, 1.25);
+
+    // 가까운 적 총알 회피
+    let dodgeX = 0, dodgeY = 0;
+    for (const b of game.bullets) {
+      if (b.owner === this) continue;
+      const d = dist(this, b);
+      if (d < 150) {
+        const mag = Math.hypot(b.vx, b.vy) || 1;
+        dodgeX += (-b.vy / mag) * (150 - d) * 0.03;
+        dodgeY += ( b.vx / mag) * (150 - d) * 0.03;
+      }
+    }
+
+    if (best) {
+      const directAngle = Math.atan2(best.y - this.y, best.x - this.x);
+      const leadFrames = clamp(bestScore / 18, 5, 18);
+      const aimX = best.x + (best.vx || 0) * leadFrames;
+      const aimY = best.y + (best.vy || 0) * leadFrames;
+      const shootAngle = Math.atan2(aimY - this.y, aimX - this.x);
+      this.angle = shootAngle;
+
+      const spd = this.derivedSpeed * 0.52;
+      const tooClose = bestScore < 170 && this.hp < this.maxHp * 0.65;
+      const moveAngle = tooClose ? directAngle + Math.PI : directAngle;
+      this.vx += Math.cos(moveAngle) * spd * (tooClose ? 1.0 : 0.65);
+      this.vy += Math.sin(moveAngle) * spd * (tooClose ? 1.0 : 0.65);
+
+      // 약간의 측면 이동으로 단순 직진을 덜 함
+      this.vx += Math.cos(directAngle + Math.PI / 2 * this.strafeDir) * 0.12;
+      this.vy += Math.sin(directAngle + Math.PI / 2 * this.strafeDir) * 0.12;
+
+      // 총알 회피
+      this.vx += dodgeX;
+      this.vy += dodgeY;
+
+      if (bestScore < this.shootRange) {
+        const bullet = this.shoot(shootAngle);
+        if (bullet) game.bullets.push(bullet);
+      }
+    } else {
+      if (this.wanderTimer <= 0) {
+        this.targetX = rand(50, MAP_W - 50);
+        this.targetY = rand(50, MAP_H - 50);
+        this.wanderTimer = randInt(90, 240);
+      }
+      const angle = Math.atan2(this.targetY - this.y, this.targetX - this.x);
+      this.angle = angle;
+      const spd = this.derivedSpeed * 0.33;
+      this.vx += Math.cos(angle) * spd;
+      this.vy += Math.sin(angle) * spd;
+      this.vx += dodgeX;
+      this.vy += dodgeY;
+    }
+
+    super.update();
+    if (this.statPoints > 0) this.autoUpgrade();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  게임 초기화
+// ═══════════════════════════════════════════════════════════════
+const BOT_NAMES = [
+  'Alpha','Bravo','Charlie','Delta','Echo',
+  'Fox','Ghost','Hawk','Iron','Jade',
+  'King','Luna','Mars','Nova','Omega'
+];
+
+function initGame() {
+  resizeCanvas();
+
+  // 업그레이드 카드 상태 초기화
+  upgradeState.queue   = 0;
+  upgradeState.showing = false;
+  upgradeState.cards   = [];
+  upgradeState.anim    = 0;
+  upgradeState.hovered = -1;
+
+  game = {
+    player   : new Player(),
+    bots     : [],
+    shapes   : [],
+    bullets  : [],
+    particles: [],
+    camera   : { x: 0, y: 0 },
+    frame    : 0,
+    over     : false,
+  };
+
+  // 봇 7개 생성
+  for (let i = 0; i < 7; i++) {
+    game.bots.push(new Bot(BOT_NAMES[i]));
+  }
+
+  // 초기 도형 스폰
+  spawnShapes(80);
+}
+
+function spawnShapes(count) {
+  const types = ['square','square','square','triangle','triangle','pentagon'];
+  for (let i = 0; i < count; i++) {
+    game.shapes.push(new Shape(types[randInt(0, types.length - 1)]));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  캔버스 리사이즈
+// ═══════════════════════════════════════════════════════════════
+function resizeCanvas() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+
+// ═══════════════════════════════════════════════════════════════
+//  카메라 업데이트
+// ═══════════════════════════════════════════════════════════════
+function updateCamera() {
+  const target = {
+    x: game.player.x - canvas.width  / 2,
+    y: game.player.y - canvas.height / 2,
+  };
+  // 부드러운 카메라 추적
+  game.camera.x = lerp(game.camera.x, target.x, 0.1);
+  game.camera.y = lerp(game.camera.y, target.y, 0.1);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  충돌 감지
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 총알 ↔ 대상 충돌
+ * @param {Bullet} b
+ * @param {Tank|Shape} target
+ */
+function bulletHit(b, target) {
+  const d = dist(b, target);
+  return d < b.radius + target.radius;
+}
+
+function processBullets() {
+  const cam = game.camera;
+  for (let i = game.bullets.length - 1; i >= 0; i--) {
+    const b = game.bullets[i];
+    b.update();
+    if (b.dead) { game.bullets.splice(i, 1); continue; }
+
+    // ── 총알 ↔ 도형 ──
+    for (let j = game.shapes.length - 1; j >= 0; j--) {
+      const s = game.shapes[j];
+      if (!bulletHit(b, s)) continue;
+
+      const kx = (s.x - b.x) / dist(b, s) * 3;
+      const ky = (s.y - b.y) / dist(b, s) * 3;
+      s.takeDamage(b.damage, kx, ky);
+      b.hp--;
+
+      if (s.dead) {
+        spawnParticles(s.x, s.y, s.color, 8);
+        b.owner.addExp(s.exp);
+        game.shapes.splice(j, 1);
+      }
+      if (b.hp <= 0) { game.bullets.splice(i, 1); break; }
+    }
+    if (i >= game.bullets.length) continue;
+
+    // ── 총알 ↔ 플레이어 ──
+    if (b.owner !== game.player && !game.player.dead) {
+      if (bulletHit(b, game.player)) {
+        const kx = (game.player.x - b.x) / dist(b, game.player) * 4;
+        const ky = (game.player.y - b.y) / dist(b, game.player) * 4;
+        game.player.takeDamage(b.damage, kx, ky);
+        playSfx('hit');
+        b.hp--;
+        if (b.hp <= 0) game.bullets.splice(i, 1);
+        continue;
+      }
+    }
+
+    // ── 총알 ↔ 봇 ──
+    for (let j = game.bots.length - 1; j >= 0; j--) {
+      const bt = game.bots[j];
+      if (b.owner === bt) continue;
+      if (!bulletHit(b, bt)) continue;
+      const kx = (bt.x - b.x) / dist(b, bt) * 4;
+      const ky = (bt.y - b.y) / dist(b, bt) * 4;
+      bt.takeDamage(b.damage, kx, ky);
+      playSfx('hit');
+      b.hp--;
+      if (bt.dead) {
+        spawnParticles(bt.x, bt.y, bt.color, 12);
+        b.owner.addExp(50 + bt.level * 15);
+        b.owner.score += bt.level * 20;
+        game.bots.splice(j, 1);
+      }
+      if (b.hp <= 0) { game.bullets.splice(i, 1); break; }
+    }
+  }
+}
+
+/**
+ * 탱크 ↔ 탱크, 탱크 ↔ 도형 몸체 충돌 처리
+ */
+function processBodyCollisions() {
+  const tanks = [game.player, ...game.bots];
+
+  // 탱크 ↔ 도형
+  for (const tank of tanks) {
+    if (tank.dead) continue;
+    for (const s of game.shapes) {
+      const d = dist(tank, s);
+      const minD = tank.radius + s.radius;
+      if (d < minD && d > 0) {
+        const nx = (s.x - tank.x) / d;
+        const ny = (s.y - tank.y) / d;
+        // 밀어내기
+        const overlap = minD - d;
+        s.x += nx * overlap * 0.5;
+        s.y += ny * overlap * 0.5;
+        tank.x -= nx * overlap * 0.5;
+        tank.y -= ny * overlap * 0.5;
+        // 데미지
+        const bodyDmg = tank.derivedBodyDmg;
+        s.takeDamage(bodyDmg * 0.05, nx * 2, ny * 2);
+        tank.takeDamage(2, -nx * 2, -ny * 2);
+      }
+    }
+  }
+
+  // 탱크 ↔ 탱크
+  for (let i = 0; i < tanks.length; i++) {
+    for (let j = i + 1; j < tanks.length; j++) {
+      const a = tanks[i], b = tanks[j];
+      if (a.dead || b.dead) continue;
+      const d = dist(a, b);
+      const minD = a.radius + b.radius;
+      if (d < minD && d > 0) {
+        const nx = (b.x - a.x) / d;
+        const ny = (b.y - a.y) / d;
+        const overlap = minD - d;
+        a.x -= nx * overlap * 0.5;
+        a.y -= ny * overlap * 0.5;
+        b.x += nx * overlap * 0.5;
+        b.y += ny * overlap * 0.5;
+        // 몸체 데미지 (작게)
+        a.takeDamage(a.derivedBodyDmg * 0.1, -nx * 3, -ny * 3);
+        b.takeDamage(b.derivedBodyDmg * 0.1,  nx * 3,  ny * 3);
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  파티클 스폰
+// ═══════════════════════════════════════════════════════════════
+function spawnParticles(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    game.particles.push(new Particle(x - game.camera.x, y - game.camera.y, color));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  배경 렌더링 (격자)
+// ═══════════════════════════════════════════════════════════════
+function drawBackground() {
+  const cam = game.camera;
+  ctx.fillStyle = '#e8f4f8';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = '#c8dce8';
+  ctx.lineWidth   = 1;
+
+  const startX = -cam.x % GRID;
+  const startY = -cam.y % GRID;
+
+  ctx.beginPath();
+  for (let x = startX; x < canvas.width; x += GRID) {
+    ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height);
+  }
+  for (let y = startY; y < canvas.height; y += GRID) {
+    ctx.moveTo(0, y); ctx.lineTo(canvas.width, y);
+  }
+  ctx.stroke();
+
+  // 맵 경계 표시
+  const mx = -cam.x, my = -cam.y;
+  ctx.strokeStyle = '#a0bccf';
+  ctx.lineWidth   = 4;
+  ctx.strokeRect(mx, my, MAP_W, MAP_H);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  UI 렌더링
+// ═══════════════════════════════════════════════════════════════
+function drawUI() {
+  const p = game.player;
+
+  // ── 경험치 바 (하단 중앙) ──
+  const exW = 400, exH = 18;
+  const exX = (canvas.width - exW) / 2;
+  const exY = canvas.height - 36;
+
+  const expNeeded = expForLevel(p.level);
+  const expRatio  = p.level >= 45 ? 1 : clamp(p.exp / expNeeded, 0, 1);
+
+  // 바 배경
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  roundRect(exX - 2, exY - 2, exW + 4, exH + 4, 10, true, false);
+
+  // 바 채우기
+  const gex = ctx.createLinearGradient(exX, exY, exX + exW, exY);
+  gex.addColorStop(0, '#667eea');
+  gex.addColorStop(1, '#764ba2');
+  ctx.fillStyle = gex;
+  if (expRatio > 0) {
+    roundRect(exX, exY, exW * expRatio, exH, 8, true, false);
+  }
+
+  // 테두리
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  roundRect(exX, exY, exW, exH, 8, false, true);
+
+  // 텍스트
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 12px "Segoe UI"';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(
+    p.level >= 45 ? `Lv.${p.level} MAX` : `Lv.${p.level}  EXP: ${p.exp} / ${expNeeded}`,
+    canvas.width / 2, exY + exH / 2
+  );
+
+  // ── 현재 직업 표시 ──
+  const jobText = p.jobId ? p.jobName : '직업 미선택';
+  const jobW = Math.max(160, ctx.measureText(jobText).width + 34);
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  roundRect(12, 12, jobW, 30, 8, true, false);
+  ctx.fillStyle = p.jobId ? '#9be7ff' : '#ccc';
+  ctx.font = 'bold 13px "Segoe UI"';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`직업: ${jobText}`, 22, 27);
+
+  // ── 스탯 업그레이드 UI (좌측 하단) ──
+  drawStatUI();
+
+  // ── 리더보드 (우측 상단) ──
+  drawLeaderboard();
+
+  // ── 미니맵 (우측 하단) ──
+  drawMinimap();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  업그레이드 카드 시스템
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 6가지 업그레이드 빌드 프리셋.
+ * 각 빌드는 deltas(스탯 변경량), 이름, 설명, 색상, 아이콘을 가짐.
+ * 레벨업 시 이 중 3개를 랜덤 선택하여 카드로 제시.
+ */
+const UPGRADE_POOL = [
+  {
+    id: 'swift',
+    name: '신속한 사수',
+    icon: '⚡',
+    color: '#4fc3f7',
+    glow: '#00bcd4',
+    desc: '빠른 이동속도와 높은 연사력으로\n적을 교란하는 스피드형 빌드',
+    tags: ['이동 ▲▲', '장전 ▲▲', '총알속도 ▲', '데미지 ▼'],
+    apply(stats) {
+      delta(stats, 'moveSpeed',    2);
+      delta(stats, 'reload',       2);
+      delta(stats, 'bulletSpeed',  1);
+      delta(stats, 'bulletDamage',-1);
+    }
+  },
+  {
+    id: 'sniper',
+    name: '정밀 저격수',
+    icon: '🎯',
+    color: '#ef9a9a',
+    glow: '#e53935',
+    desc: '강력한 총알 한 발이\n적을 꿰뚫는 고화력 빌드',
+    tags: ['데미지 ▲▲', '관통력 ▲▲', '총알속도 ▲', '장전 ▼▼'],
+    apply(stats) {
+      delta(stats, 'bulletDamage', 2);
+      delta(stats, 'bulletPen',    2);
+      delta(stats, 'bulletSpeed',  1);
+      delta(stats, 'reload',      -2);
+    }
+  },
+  {
+    id: 'tank',
+    name: '철벽 전차',
+    icon: '🛡️',
+    color: '#a5d6a7',
+    glow: '#43a047',
+    desc: '두꺼운 장갑과 몸체 데미지로\n적을 압도하는 탱커 빌드',
+    tags: ['체력 ▲▲', '체력재생 ▲▲', '몸체데미지 ▲', '이동 ▼'],
+    apply(stats) {
+      delta(stats, 'maxHealth',    2);
+      delta(stats, 'healthRegen',  2);
+      delta(stats, 'bodyDamage',   1);
+      delta(stats, 'moveSpeed',   -1);
+    }
+  },
+  {
+    id: 'berserker',
+    name: '광전사',
+    icon: '🔥',
+    color: '#ffcc80',
+    glow: '#ff6f00',
+    desc: '근접전에 특화된 폭발적인\n몸체 데미지와 고속 이동 빌드',
+    tags: ['몸체데미지 ▲▲', '이동 ▲▲', '체력 ▲', '관통력 ▼'],
+    apply(stats) {
+      delta(stats, 'bodyDamage',   2);
+      delta(stats, 'moveSpeed',    2);
+      delta(stats, 'maxHealth',    1);
+      delta(stats, 'bulletPen',   -1);
+    }
+  },
+  {
+    id: 'machinegun',
+    name: '기관포',
+    icon: '💥',
+    color: '#ce93d8',
+    glow: '#8e24aa',
+    desc: '쉬지 않는 연사로 총알 폭풍을\n쏟아붓는 화력 집중 빌드',
+    tags: ['장전 ▲▲▲', '총알속도 ▲▲', '데미지 ▼', '관통력 ▼'],
+    apply(stats) {
+      delta(stats, 'reload',       3);
+      delta(stats, 'bulletSpeed',  2);
+      delta(stats, 'bulletDamage',-1);
+      delta(stats, 'bulletPen',   -1);
+    }
+  },
+  {
+    id: 'regenerator',
+    name: '불사조',
+    icon: '💚',
+    color: '#80cbc4',
+    glow: '#00897b',
+    desc: '빠른 체력 재생으로 전장에서\n오래 버티는 지구전 빌드',
+    tags: ['체력재생 ▲▲▲', '최대체력 ▲', '총알속도 ▼', '이동 ▼'],
+    apply(stats) {
+      delta(stats, 'healthRegen',  3);
+      delta(stats, 'maxHealth',    1);
+      delta(stats, 'bulletSpeed', -1);
+      delta(stats, 'moveSpeed',   -1);
+    }
+  },
+  {
+    id: 'allround',
+    name: '균형 전사',
+    icon: '⚖️',
+    color: '#fff59d',
+    glow: '#f9a825',
+    desc: '모든 스탯을 균형 있게 올려\n어떤 상황에도 대응하는 빌드',
+    tags: ['이동 ▲', '데미지 ▲', '체력 ▲', '장전 ▲'],
+    apply(stats) {
+      delta(stats, 'moveSpeed',    1);
+      delta(stats, 'bulletDamage', 1);
+      delta(stats, 'maxHealth',    1);
+      delta(stats, 'reload',       1);
+    }
+  },
+  {
+    id: 'phantom',
+    name: '유령 저격',
+    icon: '👻',
+    color: '#b0bec5',
+    glow: '#546e7a',
+    desc: '총알 관통력을 극대화하여\n여러 적을 동시에 꿰뚫는 빌드',
+    tags: ['관통력 ▲▲▲', '데미지 ▲', '이동 ▼', '장전 ▼'],
+    apply(stats) {
+      delta(stats, 'bulletPen',    3);
+      delta(stats, 'bulletDamage', 1);
+      delta(stats, 'moveSpeed',   -1);
+      delta(stats, 'reload',      -1);
+    }
+  },
+];
+
+
+// ═══════════════════════════════════════════════════════════════
+//  직업 고정 성장 카드
+// ═══════════════════════════════════════════════════════════════
+function makeFixedCard(name, icon, color, glow, desc, tags, apply) {
+  return { name, icon, color, glow, desc, tags, apply };
+}
+
+const JOB_FIXED_POOLS = {
+  swift: [
+    makeFixedCard(
+      '가속 훈련', '⚡', '#4fc3f7', '#00bcd4',
+      `이동 속도와 재장전을 더 끌어올려\n상대를 흔드는 기동형 강화`,
+      ['이동 ▲', '장전 ▲', '총알속도 ▲'],
+      stats => {
+        delta(stats, 'moveSpeed', 1);
+        delta(stats, 'reload', 1);
+        delta(stats, 'bulletSpeed', 1);
+      }
+    ),
+    makeFixedCard(
+      '기동 탄환', '⚡', '#80deea', '#26c6da',
+      `총알을 더 빠르게 날려\n거리 싸움에서 우위를 잡는다`,
+      ['총알속도 ▲▲', '이동 ▲', '체력 ▼'],
+      stats => {
+        delta(stats, 'bulletSpeed', 2);
+        delta(stats, 'moveSpeed', 1);
+        delta(stats, 'maxHealth', -1);
+      }
+    ),
+    makeFixedCard(
+      '유연한 회피', '⚡', '#4dd0e1', '#00acc1',
+      `민첩성을 살려 생존력과 운영력을\n조금씩 함께 올린다`,
+      ['이동 ▲', '체력 ▲', '장전 ▲'],
+      stats => {
+        delta(stats, 'moveSpeed', 1);
+        delta(stats, 'maxHealth', 1);
+        delta(stats, 'reload', 1);
+      }
+    ),
+  ],
+  sniper: [
+    makeFixedCard(
+      '집중 조준', '🎯', '#ef9a9a', '#e53935',
+      `한 발의 위력을 더 높여\n원거리 교전력을 강화한다`,
+      ['데미지 ▲▲', '관통력 ▲', '장전 ▼'],
+      stats => {
+        delta(stats, 'bulletDamage', 2);
+        delta(stats, 'bulletPen', 1);
+        delta(stats, 'reload', -1);
+      }
+    ),
+    makeFixedCard(
+      '관통 탄두', '🎯', '#ffab91', '#ff7043',
+      `여러 적을 꿰뚫는 관통 성능을\n안정적으로 끌어올린다`,
+      ['관통력 ▲▲', '총알속도 ▲', '이동 ▼'],
+      stats => {
+        delta(stats, 'bulletPen', 2);
+        delta(stats, 'bulletSpeed', 1);
+        delta(stats, 'moveSpeed', -1);
+      }
+    ),
+    makeFixedCard(
+      '저격 자세', '🎯', '#f48fb1', '#d81b60',
+      `정확도를 올리면서 재장전 리듬을\n조금 더 매끄럽게 다듬는다`,
+      ['데미지 ▲', '총알속도 ▲', '장전 ▲'],
+      stats => {
+        delta(stats, 'bulletDamage', 1);
+        delta(stats, 'bulletSpeed', 1);
+        delta(stats, 'reload', 1);
+      }
+    ),
+  ],
+  tank: [
+    makeFixedCard(
+      '강철 장갑', '🛡️', '#a5d6a7', '#43a047',
+      `체력의 바탕을 더 두껍게 만들어\n버티는 힘을 키운다`,
+      ['체력 ▲▲', '체력재생 ▲', '이동 ▼'],
+      stats => {
+        delta(stats, 'maxHealth', 2);
+        delta(stats, 'healthRegen', 1);
+        delta(stats, 'moveSpeed', -1);
+      }
+    ),
+    makeFixedCard(
+      '재생 장치', '🛡️', '#c5e1a5', '#7cb342',
+      `피격 이후 복구력을 높여\n장기전에 더 강해진다`,
+      ['체력재생 ▲▲', '체력 ▲', '몸체데미지 ▲'],
+      stats => {
+        delta(stats, 'healthRegen', 2);
+        delta(stats, 'maxHealth', 1);
+        delta(stats, 'bodyDamage', 1);
+      }
+    ),
+    makeFixedCard(
+      '압도적 중량', '🛡️', '#aed581', '#9ccc65',
+      `몸통 압박과 생존력을 같이 올리는\n정면 돌파형 강화`,
+      ['몸체데미지 ▲', '체력 ▲', '장전 ▼'],
+      stats => {
+        delta(stats, 'bodyDamage', 1);
+        delta(stats, 'maxHealth', 1);
+        delta(stats, 'reload', -1);
+      }
+    ),
+  ],
+  berserker: [
+    makeFixedCard(
+      '돌격 훈련', '🔥', '#ffcc80', '#ff6f00',
+      '근접 압박과 돌파 속도를 더 끌어올린다',
+      ['몸체데미지 ▲▲', '이동 ▲▲', '체력 ▲'],
+      stats => {
+        delta(stats, 'bodyDamage', 2);
+        delta(stats, 'moveSpeed', 2);
+        delta(stats, 'maxHealth', 1);
+      }
+    ),
+    makeFixedCard(
+      '격노 충전', '🔥', '#ffb74d', '#fb8c00',
+      `정면 충돌 시 더 큰 이득을 보는\n공격적 강화`,
+      ['몸체데미지 ▲', '장전 ▲', '총알속도 ▲'],
+      stats => {
+        delta(stats, 'bodyDamage', 1);
+        delta(stats, 'reload', 1);
+        delta(stats, 'bulletSpeed', 1);
+      }
+    ),
+    makeFixedCard(
+      '광폭 방어', '🔥', '#ffab91', '#f4511e',
+      '공격력은 유지하고 생존력을 조금 더 보강한다',
+      ['체력 ▲▲', '몸체데미지 ▲', '이동 ▼'],
+      stats => {
+        delta(stats, 'maxHealth', 2);
+        delta(stats, 'bodyDamage', 1);
+        delta(stats, 'moveSpeed', -1);
+      }
+    ),
+  ],
+  machinegun: [
+    makeFixedCard(
+      '연사 개조', '💥', '#ce93d8', '#8e24aa',
+      '장전 시간을 더 줄여 탄막을 유지한다',
+      ['장전 ▲▲▲', '총알속도 ▲', '데미지 ▼'],
+      stats => {
+        delta(stats, 'reload', 3);
+        delta(stats, 'bulletSpeed', 1);
+        delta(stats, 'bulletDamage', -1);
+      }
+    ),
+    makeFixedCard(
+      '탄환 안정화', '💥', '#b39ddb', '#5e35b1',
+      '연사 중 탄속과 관통력을 조금 더 안정적으로 맞춘다',
+      ['총알속도 ▲▲', '관통력 ▲', '장전 ▲'],
+      stats => {
+        delta(stats, 'bulletSpeed', 2);
+        delta(stats, 'bulletPen', 1);
+        delta(stats, 'reload', 1);
+      }
+    ),
+    makeFixedCard(
+      '포화 사격', '💥', '#d1c4e9', '#7e57c2',
+      '총알 수를 유지하면서 화력 효율을 높인다',
+      ['장전 ▲', '데미지 ▲', '관통력 ▲'],
+      stats => {
+        delta(stats, 'reload', 1);
+        delta(stats, 'bulletDamage', 1);
+        delta(stats, 'bulletPen', 1);
+      }
+    ),
+  ],
+  regenerator: [
+    makeFixedCard(
+      '자연 치유', '💚', '#80cbc4', '#00897b',
+      '체력 회복 속도를 크게 끌어올린다',
+      ['체력재생 ▲▲▲', '최대체력 ▲'],
+      stats => {
+        delta(stats, 'healthRegen', 3);
+        delta(stats, 'maxHealth', 1);
+      }
+    ),
+    makeFixedCard(
+      '회복 순환', '💚', '#4db6ac', '#009688',
+      '피격 후 회복 흐름을 더 빠르게 이어준다',
+      ['체력재생 ▲▲', '이동 ▲', '총알속도 ▼'],
+      stats => {
+        delta(stats, 'healthRegen', 2);
+        delta(stats, 'moveSpeed', 1);
+        delta(stats, 'bulletSpeed', -1);
+      }
+    ),
+    makeFixedCard(
+      '지구력 강화', '💚', '#a7ffeb', '#26a69a',
+      '오래 살아남는 방향으로 체력 기반을 넓힌다',
+      ['최대체력 ▲▲', '체력재생 ▲', '장전 ▲'],
+      stats => {
+        delta(stats, 'maxHealth', 2);
+        delta(stats, 'healthRegen', 1);
+        delta(stats, 'reload', 1);
+      }
+    ),
+  ],
+  allround: [
+    makeFixedCard(
+      '균형 강화', '⚖️', '#fff59d', '#f9a825',
+      '모든 기본 성능을 고르게 올린다',
+      ['이동 ▲', '데미지 ▲', '체력 ▲'],
+      stats => {
+        delta(stats, 'moveSpeed', 1);
+        delta(stats, 'bulletDamage', 1);
+        delta(stats, 'maxHealth', 1);
+      }
+    ),
+    makeFixedCard(
+      '안정 개조', '⚖️', '#ffe082', '#ffb300',
+      '전투 안정성을 위해 전반적인 효율을 보강한다',
+      ['장전 ▲', '총알속도 ▲', '체력재생 ▲'],
+      stats => {
+        delta(stats, 'reload', 1);
+        delta(stats, 'bulletSpeed', 1);
+        delta(stats, 'healthRegen', 1);
+      }
+    ),
+    makeFixedCard(
+      '유틸 보강', '⚖️', '#fff8e1', '#ffca28',
+      '한쪽으로 치우치지 않는 올라운드 강화',
+      ['이동 ▲', '장전 ▲', '관통력 ▲'],
+      stats => {
+        delta(stats, 'moveSpeed', 1);
+        delta(stats, 'reload', 1);
+        delta(stats, 'bulletPen', 1);
+      }
+    ),
+  ],
+  phantom: [
+    makeFixedCard(
+      '유령 관통', '👻', '#b0bec5', '#546e7a',
+      '여러 적을 더 쉽게 뚫고 지나간다',
+      ['관통력 ▲▲▲', '데미지 ▲'],
+      stats => {
+        delta(stats, 'bulletPen', 3);
+        delta(stats, 'bulletDamage', 1);
+      }
+    ),
+    makeFixedCard(
+      '흔적 소거', '👻', '#cfd8dc', '#78909c',
+      '관통과 탄속을 높여 다중 타격을 노린다',
+      ['관통력 ▲▲', '총알속도 ▲▲', '장전 ▼'],
+      stats => {
+        delta(stats, 'bulletPen', 2);
+        delta(stats, 'bulletSpeed', 2);
+        delta(stats, 'reload', -1);
+      }
+    ),
+    makeFixedCard(
+      '그림자 저격', '👻', '#eceff1', '#90a4ae',
+      '기동을 조금 포기하고 관통 효율을 극대화한다',
+      ['관통력 ▲▲', '데미지 ▲', '이동 ▼'],
+      stats => {
+        delta(stats, 'bulletPen', 2);
+        delta(stats, 'bulletDamage', 1);
+        delta(stats, 'moveSpeed', -1);
+      }
+    ),
+  ],
+};
+
+function getFixedJobCards(jobId) {
+  return JOB_FIXED_POOLS[jobId] || null;
+}
+
+// 스탯 delta 헬퍼 (최소 0, 최대 7 클램프)
+function delta(stats, key, amount) {
+  stats[key] = clamp(stats[key] + amount, 0, 7);
+}
+
+// 업그레이드 큐 & 현재 카드 상태
+function getUpgradeCardsForPlayer() {
+  const jobCards = getFixedJobCards(game.player.jobId);
+  if (jobCards && jobCards.length) {
+    return [...jobCards].sort(() => Math.random() - 0.5).slice(0, 3);
+  }
+  const shuffled = [...UPGRADE_POOL].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, 3);
+}
+
+const upgradeState = {
+  queue:   0,          // 대기 중인 레벨업 수
+  showing: false,      // 현재 카드 표시 중 여부
+  cards:   [],         // 현재 제시된 3장 [{...preset, rect}]
+  anim:    0,          // 등장 애니메이션 (0→1)
+  hovered: -1,        // 마우스 올려진 카드 인덱스
+};
+
+// 레벨업 이벤트 → 큐에 추가
+function queueUpgradeCard() {
+  upgradeState.queue++;
+  if (!upgradeState.showing) openNextCard();
+}
+
+// 다음 카드 세트 열기
+function openNextCard() {
+  if (upgradeState.queue <= 0) { upgradeState.showing = false; return; }
+  upgradeState.queue--;
+  upgradeState.showing = true;
+  upgradeState.anim    = 0;
+  upgradeState.hovered = -1;
+
+  upgradeState.cards = getUpgradeCardsForPlayer();
+}
+
+// 카드 클릭 처리
+function handleCardClick(e) {
+  if (!upgradeState.showing) return false;
+  for (let i = 0; i < upgradeState.cards.length; i++) {
+    const r = upgradeState.cards[i].rect;
+    if (!r) continue;
+    if (e.clientX >= r.x && e.clientX <= r.x + r.w &&
+        e.clientY >= r.y && e.clientY <= r.y + r.h) {
+      const picked = upgradeState.cards[i];
+
+      // 첫 선택은 직업을 고정하고, 이후에는 같은 직업의 고정 성장만 등장
+      if (!game.player.jobId) {
+        game.player.jobId = picked.id;
+        game.player.jobName = picked.name;
+      }
+
+      picked.apply(game.player.stats);
+      game.player.maxHp = game.player.derivedMaxHp;
+      game.player.hp = Math.min(game.player.hp + 12, game.player.maxHp);
+
+      playSfx('select');
+      openNextCard();
+      return true;
+    }
+  }
+  return false;
+}
+
+// 마우스 호버 추적
+canvas.addEventListener('mousemove', e => {
+  if (!upgradeState.showing) { upgradeState.hovered = -1; return; }
+  upgradeState.hovered = -1;
+  for (let i = 0; i < upgradeState.cards.length; i++) {
+    const r = upgradeState.cards[i].rect;
+    if (!r) continue;
+    if (e.clientX >= r.x && e.clientX <= r.x + r.w &&
+        e.clientY >= r.y && e.clientY <= r.y + r.h) {
+      upgradeState.hovered = i;
+    }
+  }
+});
+
+// 카드 UI 렌더링
+function drawUpgradeCards() {
+  if (!upgradeState.showing) return;
+
+  // 애니메이션
+  upgradeState.anim = Math.min(1, upgradeState.anim + 0.06);
+  const t = easeOutBack(upgradeState.anim);
+
+  const CW = 200, CH = 260;   // 카드 너비/높이
+  const GAP = 24;
+  const totalW = CW * 3 + GAP * 2;
+  const cx = canvas.width  / 2;
+  const cy = canvas.height / 2;
+
+  // 배경 오버레이 (반투명 어둠)
+  ctx.fillStyle = `rgba(0,0,0,${0.55 * upgradeState.anim})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // 타이틀
+  ctx.save();
+  ctx.globalAlpha = upgradeState.anim;
+  ctx.fillStyle = '#ffe082';
+  ctx.font = 'bold 26px "Segoe UI"';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.shadowBlur  = 12;
+  ctx.shadowColor = '#ff8f00';
+  const title = game.player.jobId
+    ? `⬆ ${game.player.jobName} 성장  Lv.${game.player.level}`
+    : `⬆  직업 선택  Lv.${game.player.level}`;
+  ctx.fillText(title, cx, cy - CH / 2 - 18);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  upgradeState.cards.forEach((card, i) => {
+    const baseX = cx - totalW / 2 + i * (CW + GAP);
+    const baseY = cy - CH / 2;
+
+    // 슬라이드 인 오프셋
+    const slideY = (1 - t) * 60;
+    const x = baseX;
+    const y = baseY + slideY;
+    const isHov = upgradeState.hovered === i;
+
+    // 호버 시 살짝 위로
+    const hoverShift = isHov ? -10 : 0;
+
+    // 카드 rect 저장 (클릭 판정용, 실제 위치)
+    card.rect = { x, y: y + hoverShift, w: CW, h: CH };
+
+    ctx.save();
+    ctx.globalAlpha = t;
+    ctx.translate(x + CW / 2, y + CH / 2 + hoverShift);
+
+    // 그림자
+    if (isHov) {
+      ctx.shadowBlur  = 30;
+      ctx.shadowColor = card.glow;
+    }
+
+    // 카드 배경
+    const grad = ctx.createLinearGradient(-CW/2, -CH/2, CW/2, CH/2);
+    grad.addColorStop(0, isHov ? '#2a2a4a' : '#1e1e38');
+    grad.addColorStop(1, isHov ? '#1a1a30' : '#141428');
+    ctx.fillStyle = grad;
+    roundRectCenter(CW, CH, 14, true, false);
+
+    // 테두리
+    ctx.strokeStyle = isHov ? card.color : '#3a3a5a';
+    ctx.lineWidth   = isHov ? 2.5 : 1.5;
+    roundRectCenter(CW, CH, 14, false, true);
+
+    ctx.shadowBlur = 0;
+
+    // 아이콘 배경 원
+    const iconBgGrad = ctx.createRadialGradient(0, -CH/2 + 55, 0, 0, -CH/2 + 55, 38);
+    iconBgGrad.addColorStop(0, card.glow + '55');
+    iconBgGrad.addColorStop(1, 'transparent');
+    ctx.fillStyle = iconBgGrad;
+    ctx.beginPath();
+    ctx.arc(0, -CH/2 + 55, 38, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 아이콘
+    ctx.font = '38px serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(card.icon, 0, -CH/2 + 55);
+
+    // 이름
+    ctx.fillStyle = card.color;
+    ctx.font = `bold 15px "Segoe UI"`;
+    ctx.textBaseline = 'top';
+    ctx.fillText(card.name, 0, -CH/2 + 100);
+
+    // 설명 (줄바꿈 처리)
+    ctx.fillStyle = '#aaa';
+    ctx.font = `11px "Segoe UI"`;
+    const lines = card.desc.split('\n');
+    lines.forEach((line, li) => {
+      ctx.fillText(line, 0, -CH/2 + 124 + li * 15);
+    });
+
+    // 구분선
+    ctx.strokeStyle = '#3a3a5a';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(-CW/2 + 14, -CH/2 + 158);
+    ctx.lineTo( CW/2 - 14, -CH/2 + 158);
+    ctx.stroke();
+
+    // 태그 리스트
+    ctx.textAlign = 'left';
+    card.tags.forEach((tag, ti) => {
+      // 색상: ▲=초록, ▼=빨강
+      const isUp = tag.includes('▲');
+      ctx.fillStyle = isUp ? '#76ff03' : '#ff5252';
+      ctx.font = `bold 11px "Segoe UI"`;
+      ctx.fillText(tag, -CW/2 + 16, -CH/2 + 166 + ti * 18);
+    });
+
+    // 클릭 유도 버튼
+    if (isHov) {
+      ctx.fillStyle = card.color;
+      roundRectAt(0, CH/2 - 28, CW - 32, 22, 8, true, false);
+      ctx.fillStyle = '#000';
+      ctx.font = 'bold 12px "Segoe UI"';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('선택하기', 0, CH/2 - 28);
+    }
+
+    ctx.restore();
+  });
+}
+
+// 중심 기준 roundRect 헬퍼
+function roundRectCenter(w, h, r, fill, stroke) {
+  roundRectAt(0, 0, w, h, r, fill, stroke);
+}
+function roundRectAt(cx, cy, w, h, r, fill, stroke) {
+  const x = cx - w/2, y = cy - h/2;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+  if (fill)   ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+// ease-out-back 이징
+function easeOutBack(t) {
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+
+// ── 현재 스탯 요약 패널 (좌측 하단, 소형) ──
+function drawStatUI() {
+  const p = game.player;
+  const statKeys = Object.keys(p.stats);
+  const bh = 20, bw = 170;
+  const startX = 12;
+  const startY = canvas.height - 18 - statKeys.length * (bh + 2);
+
+  // 패널 배경
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  roundRect(startX - 4, startY - 6, bw + 8, statKeys.length * (bh + 2) + 10, 8, true, false);
+
+  statKeys.forEach((key, i) => {
+    const y   = startY + i * (bh + 2);
+    const lv  = p.stats[key];
+    const max = 7;
+
+    // 이름
+    ctx.fillStyle = '#bbb';
+    ctx.font = `10px "Segoe UI"`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(STAT_NAMES[i], startX + 4, y + bh / 2);
+
+    // 레벨 점(dot)
+    for (let d = 0; d < max; d++) {
+      ctx.fillStyle = d < lv ? '#4fc3f7' : '#333';
+      ctx.beginPath();
+      ctx.arc(startX + bw - 8 - (max - 1 - d) * 10, y + bh / 2, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+}
+
+// 카드 또는 기존 클릭 통합 핸들러
+canvas.addEventListener('click', e => {
+  if (game.over) return;
+  // 업그레이드 카드가 열려있으면 카드 우선 처리
+  if (upgradeState.showing) {
+    handleCardClick(e);
+    return;
+  }
+});
+
+
+function drawLeaderboard() {
+  const allTanks = [game.player, ...game.bots].filter(t => !t.dead);
+  allTanks.sort((a, b) => b.score - a.score);
+  const top = allTanks.slice(0, 8);
+
+  const lx = canvas.width - 190, ly = 12;
+  const lw = 178, lh = top.length * 22 + 30;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(lx, ly, lw, lh, 8, true, false);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 13px "Segoe UI"';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText('🏆 리더보드', lx + lw / 2, ly + 8);
+
+  top.forEach((t, i) => {
+    const ry = ly + 30 + i * 22;
+    // 현재 플레이어 강조
+    if (t === game.player) {
+      ctx.fillStyle = 'rgba(78,195,196,0.3)';
+      ctx.fillRect(lx + 2, ry - 2, lw - 4, 20);
+    }
+    ctx.fillStyle = t === game.player ? '#4fc3f7' : '#ddd';
+    ctx.font = `${t === game.player ? 'bold ' : ''}12px "Segoe UI"`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`${i + 1}. ${t.name}`, lx + 8, ry);
+    ctx.textAlign = 'right';
+    ctx.fillText(t.score.toLocaleString(), lx + lw - 8, ry);
+  });
+}
+
+// ── 미니맵 ──
+function drawMinimap() {
+  const mm = 140;  // 미니맵 크기
+  const mx = canvas.width - mm - 12;
+  const my = canvas.height - mm - 12;
+  const scale = mm / MAP_W;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  roundRect(mx, my, mm, mm, 4, true, false);
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 1;
+  roundRect(mx, my, mm, mm, 4, false, true);
+
+  // 도형
+  for (const s of game.shapes) {
+    ctx.fillStyle = SHAPE_TYPES[s.type].color;
+    ctx.fillRect(mx + s.x * scale - 1, my + s.y * scale - 1, 2, 2);
+  }
+
+  // 봇
+  for (const b of game.bots) {
+    if (b.dead) continue;
+    ctx.fillStyle = b.color;
+    ctx.beginPath();
+    ctx.arc(mx + b.x * scale, my + b.y * scale, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // 플레이어
+  ctx.fillStyle = '#4fc3f7';
+  ctx.beginPath();
+  ctx.arc(mx + game.player.x * scale, my + game.player.y * scale, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// ── 둥근 사각형 헬퍼 ──
+function roundRect(x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+  if (fill)   ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  뷰포트 컬링 (화면 안 객체만 그리기)
+// ═══════════════════════════════════════════════════════════════
+function inView(obj, cam, margin = 60) {
+  return (
+    obj.x - cam.x > -margin &&
+    obj.x - cam.x < canvas.width  + margin &&
+    obj.y - cam.y > -margin &&
+    obj.y - cam.y < canvas.height + margin
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  메인 루프
+// ═══════════════════════════════════════════════════════════════
+function gameLoop() {
+  if (game.over) return;
+  game.frame++;
+
+  // 카드 선택 중에는 업데이트 멈춤 (렌더링은 계속)
+  if (!upgradeState.showing) {
+    // ── 업데이트 ──
+
+    // 플레이어 총알 발사
+    if (mouse.down) {
+      const b = game.player.shoot(game.player.angle);
+      if (b) game.bullets.push(b);
+    }
+    game.player.update();
+
+    // 봇 업데이트 & 재스폰
+    for (let i = game.bots.length - 1; i >= 0; i--) {
+      const b = game.bots[i];
+      if (b.dead) {
+        game.bots.splice(i, 1);
+      } else {
+        b.update();
+      }
+    }
+    // 봇 수 유지
+    while (game.bots.length < 7) {
+      const name = BOT_NAMES[randInt(0, BOT_NAMES.length - 1)];
+      game.bots.push(new Bot(name));
+    }
+
+    // 도형 스폰 유지
+    if (game.shapes.length < 60 && game.frame % 30 === 0) {
+      spawnShapes(3);
+    }
+
+    // 총알 처리
+    processBullets();
+
+    // 몸체 충돌
+    processBodyCollisions();
+
+    // 파티클
+    for (let i = game.particles.length - 1; i >= 0; i--) {
+      game.particles[i].update();
+      if (game.particles[i].dead) game.particles.splice(i, 1);
+    }
+
+    // 카메라
+    updateCamera();
+  }
+
+  // ── 렌더링 ──
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  drawBackground();
+
+  const cam = game.camera;
+
+  // 도형
+  for (const s of game.shapes) {
+    if (inView(s, cam)) s.draw(cam);
+  }
+
+  // 총알
+  for (const b of game.bullets) {
+    if (inView(b, cam, 20)) b.draw(cam);
+  }
+
+  // 봇
+  for (const b of game.bots) {
+    if (!b.dead && inView(b, cam)) b.draw(cam);
+  }
+
+  // 플레이어
+  if (!game.player.dead) {
+    game.player.draw(cam);
+  }
+
+  // 파티클
+  for (const p of game.particles) p.draw();
+
+  // UI
+  drawUI();
+
+  // 업그레이드 카드 (최상위 레이어)
+  drawUpgradeCards();
+
+  // ── 사망 판정 ──
+  if (game.player.dead) {
+    game.over = true;
+    showDeathScreen();
+    return;
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  사망 처리
+// ═══════════════════════════════════════════════════════════════
+function showDeathScreen() {
+  playSfx('death');
+  const el = document.getElementById('death-screen');
+  el.style.display = 'flex';
+
+  const allTanks = [game.player, ...game.bots];
+  allTanks.sort((a, b) => b.score - a.score);
+  const rank = allTanks.findIndex(t => t === game.player) + 1;
+
+  document.getElementById('death-info').textContent =
+    `레벨 ${game.player.level} · 점수 ${game.player.score.toLocaleString()} · 순위 ${rank}위`;
+}
+
+function restartGame() {
+  document.getElementById('death-screen').style.display = 'none';
+  initGame();
+  requestAnimationFrame(gameLoop);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  시작
+// ═══════════════════════════════════════════════════════════════
+initGame();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
